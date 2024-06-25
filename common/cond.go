@@ -157,6 +157,26 @@ func IndexIndexed[T any](arr []T, block func(index int, it T) bool) int {
 	return -1
 }
 
+func Remove[T any](arr []T, block func(it T) bool) []T {
+	var retArr []T
+	for _, it := range arr {
+		if !block(it) {
+			retArr = append(retArr, it)
+		}
+	}
+	return retArr
+}
+
+func RemoveIndexed[T any](arr []T, block func(index int, it T) bool) []T {
+	var retArr []T
+	for index, it := range arr {
+		if !block(index, it) {
+			retArr = append(retArr, it)
+		}
+	}
+	return retArr
+}
+
 //go:norace
 func Dup[T any](obj T) T {
 	pointer := uintptr(unsafe.Pointer(&obj))
