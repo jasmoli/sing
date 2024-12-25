@@ -22,7 +22,23 @@ func DialSerial(ctx context.Context, dialer Dialer, network string, destination 
 	for _, address := range destinationAddresses {
 		go func(address netip.Addr) {
 			conn, err := dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
-			group.add(conn, err)
+			group.add(conn, address, err)
+		}(address)
+	}
+	conn, _, err := group.wait()
+	return conn, err
+}
+
+func DialSerialWithAddr(ctx context.Context, dialer Dialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, netip.Addr, error) {
+	if parallelDialer, isParallel := dialer.(ParallelDialer); isParallel {
+		return parallelDialer.DialParallelWithAddr(ctx, network, destination, destinationAddresses)
+	}
+	length := len(destinationAddresses)
+	group := newTCPConnGroup(length)
+	for _, address := range destinationAddresses {
+		go func(address netip.Addr) {
+			conn, err := dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
+			group.add(conn, address, err)
 		}(address)
 	}
 	return group.wait()
@@ -120,8 +136,90 @@ func DialParallel(ctx context.Context, dialer Dialer, network string, destinatio
 	}
 }
 
+func DialParallelWithAddr(ctx context.Context, dialer Dialer, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, preferIPv6 bool, fallbackDelay time.Duration) (net.Conn, netip.Addr, error) {
+	// kanged form net.Dial
+
+	if fallbackDelay == 0 {
+		fallbackDelay = DefaultFallbackDelay
+	}
+
+	returned := make(chan struct{})
+	defer close(returned)
+
+	addresses4 := common.Filter(destinationAddresses, func(address netip.Addr) bool {
+		return address.Is4() || address.Is4In6()
+	})
+	addresses6 := common.Filter(destinationAddresses, func(address netip.Addr) bool {
+		return address.Is6() && !address.Is4In6()
+	})
+	if len(addresses4) == 0 || len(addresses6) == 0 {
+		return DialSerialWithAddr(ctx, dialer, network, destination, destinationAddresses)
+	}
+	var primaries, fallbacks []netip.Addr
+	if preferIPv6 {
+		primaries = addresses6
+		fallbacks = addresses4
+	} else {
+		primaries = addresses4
+		fallbacks = addresses6
+	}
+	type dialResult struct {
+		net.Conn
+		netip.Addr
+		error
+		primary bool
+		done    bool
+	}
+	results := make(chan dialResult) // unbuffered
+	startRacer := func(ctx context.Context, primary bool) {
+		ras := primaries
+		if !primary {
+			ras = fallbacks
+		}
+		c, addr, err := DialSerialWithAddr(ctx, dialer, network, destination, ras)
+		select {
+		case results <- dialResult{Conn: c, Addr: addr, error: err, primary: primary, done: true}:
+		case <-returned:
+			if c != nil {
+				c.Close()
+			}
+		}
+	}
+	var primary, fallback dialResult
+	primaryCtx, primaryCancel := context.WithCancel(ctx)
+	defer primaryCancel()
+	go startRacer(primaryCtx, true)
+	fallbackTimer := time.NewTimer(fallbackDelay)
+	defer fallbackTimer.Stop()
+	for {
+		select {
+		case <-fallbackTimer.C:
+			fallbackCtx, fallbackCancel := context.WithCancel(ctx)
+			defer fallbackCancel()
+			go startRacer(fallbackCtx, false)
+
+		case res := <-results:
+			if res.error == nil {
+				return res.Conn, res.Addr, nil
+			}
+			if res.primary {
+				primary = res
+			} else {
+				fallback = res
+			}
+			if primary.done && fallback.done {
+				return nil, netip.Addr{}, primary.error
+			}
+			if res.primary && fallbackTimer.Stop() {
+				fallbackTimer.Reset(0)
+			}
+		}
+	}
+}
+
 type tcpConn struct {
 	conn net.Conn
+	addr netip.Addr
 	err  error
 }
 
@@ -134,11 +232,11 @@ func newTCPConnGroup(count int) tcpConnGroup {
 	return tcpConnGroup{count, make(chan tcpConn, count)}
 }
 
-func (g *tcpConnGroup) add(conn net.Conn, err error) {
-	g.channel <- tcpConn{conn, err}
+func (g *tcpConnGroup) add(conn net.Conn, addr netip.Addr, err error) {
+	g.channel <- tcpConn{conn, addr, err}
 }
 
-func (g *tcpConnGroup) wait() (net.Conn, error) {
+func (g *tcpConnGroup) wait() (net.Conn, netip.Addr, error) {
 	var i int
 	var errors []error
 	defer func() {
@@ -147,11 +245,11 @@ func (g *tcpConnGroup) wait() (net.Conn, error) {
 	for i = 0; i < g.count; i++ {
 		tc := <-g.channel
 		if tc.err == nil {
-			return tc.conn, nil
+			return tc.conn, tc.addr, nil
 		}
 		errors = append(errors, tc.err)
 	}
-	return nil, E.Errors(errors...)
+	return nil, netip.Addr{}, E.Errors(errors...)
 }
 
 func (g *tcpConnGroup) close(index int) {
